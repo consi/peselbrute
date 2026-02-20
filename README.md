@@ -12,9 +12,9 @@ PESEL (Powszechny Elektroniczny System Ewidencji Ludności) is the Polish nation
 
 - **ZipCrypto fast path** - parses the raw ZIP local file header, reconstructs the ZipCrypto key stream, and filters candidates without decompressing most of them. This is the default when the ZIP uses the standard ZipCrypto (method ≠ 99) encryption.
 - **ZIP library path** - falls back to the [yeka/zip](https://github.com/yeka/zip) library for non-standard or AES-encrypted entries.
-- **PDF Standard fast path** - parses the PDF trailer/encryption dictionary once and validates candidates in-process for `/Filter /Standard` (R=2..4).
+- **PDF Standard fast path** - parses the PDF trailer/encryption dictionary once and validates candidates in-process for `/Filter /Standard` (R=2..6).
 
-Candidates are searched outward from 1977 (a statistically likely birth year) toward both ends of the 1900–today range simultaneously, so common birth years are tried first.
+Candidates are searched outward from 1990 (a statistically likely birth year) toward both ends of the 1900–today range simultaneously, so common birth years are tried first.
 
 All available CPU cores are used in parallel, typically achieving tens to hundreds of millions of candidates per second on modern hardware.
 
@@ -46,21 +46,6 @@ make build
 peselbrute [flags] <file.{zip|pdf}>
 ```
 
-**Example:**
-
-```
-$ peselbrute secret.zip
-File:    secret.zip (ZIP, 1 entries)
-Entry:   document.pdf (204800 bytes)
-Mode:    ZIP ZipCrypto (fast)
-Workers: 10
-Search:  ~459M candidates (1900-2026-02-20, from 1977 outward)
-  Checked: 37M | Speed: 142.3M/s | Elapsed: 0.3s
-
-*** PASSWORD FOUND: 77031512345 ***
-Time: 312ms | Checked: 37450000
-```
-
 ## Performance
 
 The ZIP ZipCrypto fast path is CPU-bound and can be extremely fast. The PDF `/Filter /Standard` path is also CPU-bound, but for `/R>=3` it requires 20 RC4 passes per candidate (per the PDF spec), so it is much slower in practice.
@@ -68,8 +53,9 @@ The ZIP ZipCrypto fast path is CPU-bound and can be extremely fast. The PDF `/Fi
 | Mode | Typical speed |
 |------|--------------|
 | ZIP ZipCrypto fast | 100–500 M/s |
-| PDF Standard fast | 0.2–2 M/s |
-| ZIP library fallback | 1–3 M/s |
+| ZIP library fallback | 0.2–1 M/s |
+| PDF Standard fast (R=2..4) | 0.2–2 M/s |
+| PDF Standard fast (R=5..6) | 10k–50k/s |
 
 The entire PESEL space (~460 M candidates for 1900–2026) is typically exhausted in under 5 seconds on the fast path.
 
@@ -85,9 +71,9 @@ Sample result on `test.pdf` (8 workers):
 
 ```
 File:    test.pdf (PDF)
-Mode:    PDF Standard (fast)
+Mode:    PDF Standard R=6 AES-256
 Workers: 8
-Search:  ~460M candidates (1900-2026-02-20, from 1977 outward)
+Search:  ~460.7M candidates (1900-2026-02-20, from 1990 outward)
 
 Benchmark: 10s | Checked: 3630000 | Speed: 0.4M/s
 ```

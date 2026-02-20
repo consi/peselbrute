@@ -3,11 +3,15 @@ package main
 import (
 	"bytes"
 	"compress/flate"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/md5"
-	"flag"
+	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"flag"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -46,6 +50,32 @@ func init() {
 	}
 	for i := range rc4Init {
 		rc4Init[i] = byte(i)
+	}
+}
+
+func formatCount(n int64) string {
+	switch {
+	case n >= 1e9:
+		return fmt.Sprintf("%.1fG", float64(n)/1e9)
+	case n >= 1e6:
+		return fmt.Sprintf("%.1fM", float64(n)/1e6)
+	case n >= 1e3:
+		return fmt.Sprintf("%.1fk", float64(n)/1e3)
+	default:
+		return strconv.FormatInt(n, 10)
+	}
+}
+
+func formatRate(perSec float64) string {
+	switch {
+	case perSec >= 1e9:
+		return fmt.Sprintf("%.1fG/s", perSec/1e9)
+	case perSec >= 1e6:
+		return fmt.Sprintf("%.1fM/s", perSec/1e6)
+	case perSec >= 1e3:
+		return fmt.Sprintf("%.1fk/s", perSec/1e3)
+	default:
+		return fmt.Sprintf("%.1f/s", perSec)
 	}
 }
 
@@ -118,6 +148,7 @@ type pdfVerifier struct {
 	baseTail []byte
 	u        [32]byte
 	uSeed16  [16]byte
+	uValSalt [8]byte // for R>=5: u[32:40] validation salt
 }
 
 type pdfVerifyState struct {
@@ -125,6 +156,8 @@ type pdfVerifyState struct {
 	key    [16]byte
 	out32  [32]byte
 	out16  [16]byte
+	// Pre-allocated buffers for R=6 iterative hash (allocation-free hot path)
+	r6plain []byte // 64 * (passLen + 32 + udataLen) — reused every iteration
 }
 
 var (
@@ -192,14 +225,14 @@ func parsePDFTarget(data []byte) (*pdfTarget, error) {
 		return nil, errors.New("unsupported PDF Encrypt generation (only 0 supported)")
 	}
 
+	var id0 []byte
 	idMatch := rePDFTrailerID.FindSubmatch(trailerDict)
-	if len(idMatch) != 2 {
-		return nil, errors.New("PDF trailer /ID[0] is required")
-	}
-	id0Hex := compactHexSpaces(string(idMatch[1]))
-	id0, err := hex.DecodeString(id0Hex)
-	if err != nil {
-		return nil, fmt.Errorf("invalid PDF trailer ID[0]: %w", err)
+	if len(idMatch) == 2 {
+		id0Hex := compactHexSpaces(string(idMatch[1]))
+		id0, err = hex.DecodeString(id0Hex)
+		if err != nil {
+			return nil, fmt.Errorf("invalid PDF trailer ID[0]: %w", err)
+		}
 	}
 
 	encDict, err := findPDFObjectDict(data, objNum)
@@ -211,23 +244,37 @@ func parsePDFTarget(data []byte) (*pdfTarget, error) {
 	}
 
 	r, err := extractPDFInt(encDict, rePDFR, "R")
+	if err == nil && r < 5 && id0 == nil {
+		return nil, errors.New("PDF trailer /ID[0] is required for R<5")
+	}
 	if err != nil {
 		return nil, err
 	}
-	if r < 2 || r > 4 {
-		return nil, fmt.Errorf("unsupported PDF revision R=%d (supported: 2-4)", r)
+	if r < 2 || r > 6 {
+		return nil, fmt.Errorf("unsupported PDF revision R=%d (supported: 2-6)", r)
 	}
 
 	keyBits, err := extractPDFInt(encDict, rePDFLength, "Length")
 	if err != nil {
 		if r == 2 {
 			keyBits = 40
+		} else if r >= 5 {
+			keyBits = 256
 		} else {
 			return nil, err
 		}
 	}
 	keyLen := keyBits / 8
-	if keyLen < 5 || keyLen > 16 {
+	if r >= 5 {
+		// Some PDFs store Length in bytes (e.g. 32 for AES-256); treat 32 as 256 bits
+		if keyBits == 32 && keyLen == 4 {
+			keyBits = 256
+			keyLen = 32
+		}
+		if keyLen != 16 && keyLen != 32 {
+			return nil, fmt.Errorf("unsupported PDF key length for R>=5: %d bits", keyBits)
+		}
+	} else if keyLen < 5 || keyLen > 16 {
 		return nil, fmt.Errorf("unsupported PDF key length: %d bits", keyBits)
 	}
 
@@ -244,7 +291,13 @@ func parsePDFTarget(data []byte) (*pdfTarget, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(o) < 32 || len(u) < 32 {
+	uLen := 32
+	oLen := 32
+	if r >= 5 {
+		uLen = 48
+		oLen = 48
+	}
+	if len(o) < oLen || len(u) < uLen {
 		return nil, errors.New("invalid PDF O/U entries")
 	}
 
@@ -256,8 +309,8 @@ func parsePDFTarget(data []byte) (*pdfTarget, error) {
 	return &pdfTarget{
 		r:               r,
 		keyLen:          keyLen,
-		o:               o[:32],
-		u:               u[:32],
+		o:               o[:oLen],
+		u:               u[:uLen],
 		p:               int32(pVal),
 		id0:             id0,
 		encryptMetadata: encryptMetadata,
@@ -411,7 +464,86 @@ func padPDFPassword(pass []byte) [32]byte {
 	return out
 }
 
+// pdfHashR5 computes SHA-256(password + salt + udata) for R=5 user password verification.
+func pdfHashR5(password, salt, udata []byte) [32]byte {
+	h := sha256.New()
+	h.Write(password)
+	h.Write(salt)
+	h.Write(udata)
+	var out [32]byte
+	h.Sum(out[:0])
+	return out
+}
+
+// pdfHashR6 computes the R=6 iterative hash (ISO 32000-2, Algorithm 2.B).
+// K is variable-length: 32 (SHA-256), 48 (SHA-384), or 64 (SHA-512) bytes.
+// plainBuf must be pre-allocated with at least 64*(len(password)+64+len(udata)) bytes.
+func pdfHashR6(password, salt, udata, plainBuf []byte) [32]byte {
+	k256 := pdfHashR5(password, salt, udata)
+	var kBuf [64]byte
+	copy(kBuf[:], k256[:])
+	kLen := 32
+
+	for round := 0; ; round++ {
+		k1Len := len(password) + kLen + len(udata)
+		plainLen := k1Len * 64
+		plain := plainBuf[:plainLen]
+
+		off := 0
+		copy(plain[off:], password)
+		off += len(password)
+		copy(plain[off:], kBuf[:kLen])
+		off += kLen
+		copy(plain[off:], udata)
+		for i := 1; i < 64; i++ {
+			copy(plain[i*k1Len:], plain[:k1Len])
+		}
+
+		block, _ := aes.NewCipher(kBuf[:16])
+		cipher.NewCBCEncrypter(block, kBuf[16:32]).CryptBlocks(plain, plain)
+
+		s := 0
+		for _, b := range plain[:16] {
+			s += int(b)
+		}
+		switch s % 3 {
+		case 0:
+			h := sha256.Sum256(plain)
+			copy(kBuf[:], h[:])
+			kLen = 32
+		case 1:
+			h := sha512.Sum384(plain)
+			copy(kBuf[:], h[:])
+			kLen = 48
+		default:
+			h := sha512.Sum512(plain)
+			copy(kBuf[:], h[:])
+			kLen = 64
+		}
+		// ISO 32000-2 (Algorithm 2.B): run at least 64 rounds (i=0..63),
+		// then stop when the last byte of E is <= i-32.
+		if round >= 64 && int(plain[plainLen-1]) <= round-32 {
+			break
+		}
+	}
+	var out [32]byte
+	copy(out[:], kBuf[:32])
+	return out
+}
+
 func (t *pdfTarget) verifyPassword(pass []byte) bool {
+	if t.r >= 5 {
+		if len(pass) > 127 {
+			pass = pass[:127]
+		}
+		if t.r == 5 {
+			h := pdfHashR5(pass, t.u[32:40], nil)
+			return bytes.Equal(h[:], t.u[:32])
+		}
+		plainBuf := make([]byte, 64*(len(pass)+64))
+		h := pdfHashR6(pass, t.u[32:40], nil, plainBuf)
+		return bytes.Equal(h[:], t.u[:32])
+	}
 	padded := padPDFPassword(pass)
 
 	need := 32 + len(t.o) + 4 + len(t.id0) + 4
@@ -485,8 +617,11 @@ func newPDFVerifier(t *pdfTarget) *pdfVerifier {
 		baseTail: baseTail,
 	}
 	copy(v.u[:], t.u[:32])
+	if t.r >= 5 && len(t.u) >= 48 {
+		copy(v.uValSalt[:], t.u[32:40])
+	}
 
-	if t.r >= 3 {
+	if t.r >= 3 && t.r < 5 {
 		seedLen := 32 + len(t.id0)
 		var seedArr [96]byte
 		seed := seedArr[:seedLen]
@@ -508,10 +643,25 @@ func newPDFVerifyState(v *pdfVerifier) *pdfVerifyState {
 	}
 	copy(st.base[11:32], pdfPasswordPad[:21])
 	copy(st.base[32:], v.baseTail)
+	if v.r >= 6 {
+		// Pre-allocate buffer for R=6: max K is 64 bytes (SHA-512), so 64 * (11 + 64) = 4800
+		st.r6plain = make([]byte, 64*(11+64))
+	}
 	return st
 }
 
 func (v *pdfVerifier) verifyPass11(pass *[11]byte, st *pdfVerifyState) bool {
+	if v.r == 5 {
+		// R=5: SHA-256(password[11] + valSalt[8]) — zero allocation
+		var buf [19]byte
+		copy(buf[:11], pass[:])
+		copy(buf[11:], v.uValSalt[:])
+		return sha256.Sum256(buf[:]) == v.u
+	}
+	if v.r >= 6 {
+		h := pdfHashR6(pass[:], v.uValSalt[:], nil, st.r6plain)
+		return h == v.u
+	}
 	copy(st.base[:11], pass[:])
 
 	sum := md5.Sum(st.base)
@@ -622,7 +772,7 @@ func generateDates(ch chan<- dateTask, found *atomic.Bool) {
 	now := time.Now()
 	ty, tm, td := now.Year(), int(now.Month()), now.Day()
 
-	fy, fm, fd := 1977, 1, 1
+	fy, fm, fd := 1990, 1, 1
 	by, bm, bd := 1976, 12, 31
 
 	next := func(y, m, d int) (int, int, int) {
@@ -846,6 +996,7 @@ func pdfWorker(
 ) {
 	verifier := newPDFVerifier(target)
 	state := newPDFVerifyState(verifier)
+	slowPath := target.r >= 5
 
 	for task := range ch {
 		if found.Load() {
@@ -862,6 +1013,9 @@ func pdfWorker(
 			pesel[i] = byte('0' + dd[i])
 		}
 
+		// R>=5 is slow enough that atomics per candidate can matter; batch increments.
+		// This also keeps "Checked" accurate (previous logic accidentally double-counted).
+		var pending int64
 		for s3 := 0; s3 < 10; s3++ {
 			pesel[6] = byte('0' + s3)
 			p3 := partW + mul7[s3]
@@ -877,8 +1031,19 @@ func pdfWorker(
 						cd := (10 - wsum%10) % 10
 						pesel[10] = byte('0' + cd)
 
+						if slowPath {
+							pending++
+							if pending >= 512 {
+								counter.Add(pending)
+								pending = 0
+							}
+						}
 						if !verifier.verifyPass11(&pesel, state) {
 							continue
+						}
+						if slowPath && pending > 0 {
+							counter.Add(pending)
+							pending = 0
 						}
 						if found.CompareAndSwap(false, true) {
 							resultCh <- string(pesel[:])
@@ -888,7 +1053,13 @@ func pdfWorker(
 				}
 			}
 		}
-		counter.Add(10000)
+		if slowPath {
+			if pending > 0 {
+				counter.Add(pending)
+			}
+		} else {
+			counter.Add(10000)
+		}
 	}
 }
 
@@ -971,7 +1142,16 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Unsupported/invalid encrypted PDF: %v\n", err)
 			os.Exit(1)
 		}
-		mode = "PDF Standard (fast)"
+		switch {
+		case pdfT.r >= 6:
+			mode = "PDF Standard R=6 AES-256"
+		case pdfT.r == 5:
+			mode = "PDF Standard R=5 AES-256"
+		case pdfT.r == 4:
+			mode = "PDF Standard R=4 (fast)"
+		default:
+			mode = fmt.Sprintf("PDF Standard R=%d (fast)", pdfT.r)
+		}
 	default:
 		fmt.Fprintln(os.Stderr, "Unsupported file format (expected ZIP or PDF)")
 		os.Exit(1)
@@ -986,8 +1166,9 @@ func main() {
 
 	now := time.Now()
 	totalDays := int(now.Sub(time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC)).Hours() / 24)
-	fmt.Printf("Search:  ~%dM candidates (1900-%s, from 1977 outward)\n",
-		totalDays/100, now.Format("2006-01-02"))
+	totalCandidates := int64(totalDays) * 10000
+	fmt.Printf("Search:  ~%s candidates (1900-%s, from 1990 outward)\n",
+		formatCount(totalCandidates), now.Format("2006-01-02"))
 
 	var found atomic.Bool
 	var counter atomic.Int64
@@ -1004,8 +1185,8 @@ func main() {
 			if e < 1e-9 {
 				e = 1e-9
 			}
-			fmt.Printf("\nBenchmark: %s | Checked: %d | Speed: %.1fM/s\n",
-				benchDur.String(), c, float64(c)/e/1_000_000)
+			fmt.Printf("\nBenchmark: %s | Checked: %s | Speed: %s\n",
+				benchDur.String(), formatCount(c), formatRate(float64(c)/e))
 			os.Exit(0)
 		})
 	}
@@ -1021,8 +1202,14 @@ func main() {
 				c := counter.Load()
 				e := time.Since(start).Seconds()
 				if e > 0.5 {
-					fmt.Printf("\r  Checked: %dM | Speed: %.1fM/s | Elapsed: %.1fs        ",
-						c/1_000_000, float64(c)/e/1_000_000, e)
+					rate := float64(c) / e
+					eta := ""
+					if rate > 0 && c < totalCandidates {
+						rem := time.Duration(float64(totalCandidates-c)/rate) * time.Second
+						eta = " | ETA: " + rem.Truncate(time.Second).String()
+					}
+					fmt.Printf("\r  Checked: %s | Speed: %s | Elapsed: %.1fs%s        ",
+						formatCount(c), formatRate(rate), e, eta)
 				}
 			}
 		}()
@@ -1060,9 +1247,9 @@ func main() {
 	fmt.Println()
 	if ok {
 		fmt.Printf("\n*** PASSWORD FOUND: %s ***\n", password)
-		fmt.Printf("Time: %s | Checked: %d\n", elapsed.Round(time.Millisecond), counter.Load())
+		fmt.Printf("Time: %s | Checked: %s\n", elapsed.Round(time.Millisecond), formatCount(counter.Load()))
 	} else {
-		fmt.Printf("\nPassword not found. Checked: %d | Time: %s\n",
-			counter.Load(), elapsed.Round(time.Millisecond))
+		fmt.Printf("\nPassword not found. Checked: %s | Time: %s\n",
+			formatCount(counter.Load()), elapsed.Round(time.Millisecond))
 	}
 }
