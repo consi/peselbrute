@@ -8,13 +8,13 @@ PESEL (Powszechny Elektroniczny System Ewidencji Ludności) is the Polish nation
 
 ## How it works
 
-`peselbrute` generates every valid PESEL for birth dates from 1900 to today and tries each one as the file password. The tool auto-detects ZIP vs PDF from file signature and uses one of these strategies:
+`peselbrute` generates every valid PESEL for birth dates in a given range (default: 1900 to today) and tries each one as the file password. You can narrow the search with `-from`, `-to`, and `-sex` flags. The tool auto-detects ZIP vs PDF from file signature and uses one of these strategies:
 
 - **ZipCrypto fast path** - parses the raw ZIP local file header, reconstructs the ZipCrypto key stream, and filters candidates without decompressing most of them. This is the default when the ZIP uses the standard ZipCrypto (method ≠ 99) encryption.
 - **ZIP library path** - falls back to the [yeka/zip](https://github.com/yeka/zip) library for non-standard or AES-encrypted entries.
 - **PDF Standard fast path** - parses the PDF trailer/encryption dictionary once and validates candidates in-process for `/Filter /Standard` (R=2..6).
 
-Candidates are searched outward from 1990 (a statistically likely birth year) toward both ends of the 1900–today range simultaneously, so common birth years are tried first.
+Candidates are searched outward from the middle of the date range toward both ends simultaneously, so central (statistically likely) birth years are tried first.
 
 All available CPU cores are used in parallel, typically achieving tens to hundreds of millions of candidates per second on modern hardware.
 
@@ -44,6 +44,27 @@ make build
 
 ```bash
 peselbrute [flags] <file.{zip|pdf}>
+```
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-from` | Start of birth date range (YYYY-MM-DD) | `1900-01-01` |
+| `-to` | End of birth date range (YYYY-MM-DD) | today |
+| `-sex` | Filter by sex: `m` (male) or `f` (female) | both |
+| `-workers` | Number of parallel workers | number of CPUs |
+| `-bench` | Benchmark mode: run for duration and exit (e.g. `5s`, `1m`) | disabled |
+
+### Examples
+
+```bash
+# Crack with default settings (all PESELs from 1900 to today)
+./peselbrute secret.zip
+
+# Narrow to a known birth date range
+./peselbrute -from 1980-01-01 -to 1989-12-31 secret.pdf
+
+# Search only male PESELs born in October 1980
+./peselbrute -from 1980-10-01 -to 1980-10-31 -sex m secret.pdf
 ```
 
 ## Performance

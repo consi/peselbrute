@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"compress/flate"
 	"crypto/aes"
-	"crypto/cipher"
 	"crypto/md5"
 	"crypto/sha256"
 	"crypto/sha512"
@@ -517,7 +516,18 @@ func pdfHashR6(password, salt, udata, plainBuf []byte) [32]byte {
 		}
 
 		block, _ := aes.NewCipher(kBuf[:16])
-		cipher.NewCBCEncrypter(block, kBuf[16:32]).CryptBlocks(plain, plain)
+		// Manual CBC — avoids cipher.NewCBCEncrypter heap allocation.
+		{
+			var prev [16]byte
+			copy(prev[:], kBuf[16:32])
+			for i := 0; i < plainLen; i += 16 {
+				for j := 0; j < 16; j++ {
+					plain[i+j] ^= prev[j]
+				}
+				block.Encrypt(plain[i:i+16], plain[i:i+16])
+				copy(prev[:], plain[i:i+16])
+			}
+		}
 
 		lastE = plain[plainLen-1]
 
