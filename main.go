@@ -132,6 +132,14 @@ const (
 	fileKindPDF
 )
 
+type sexFilter int
+
+const (
+	sexAll    sexFilter = iota
+	sexMale             // PESEL digit 10 is odd
+	sexFemale           // PESEL digit 10 is even
+)
+
 type pdfTarget struct {
 	r               int
 	keyLen          int
@@ -484,7 +492,16 @@ func pdfHashR6(password, salt, udata, plainBuf []byte) [32]byte {
 	copy(kBuf[:], k256[:])
 	kLen := 32
 
+	// ISO 32000-2 (Algorithm 2.B): run at least 64 rounds (i=0..63),
+	// then stop when the last byte of E is <= i-32.
+	// The termination check uses the PREVIOUS round's E, so we save
+	// its last byte and check BEFORE computing the next round.
+	var lastE byte
 	for round := 0; ; round++ {
+		if round >= 64 && int(lastE) <= round-32 {
+			break
+		}
+
 		k1Len := len(password) + kLen + len(udata)
 		plainLen := k1Len * 64
 		plain := plainBuf[:plainLen]
@@ -501,6 +518,8 @@ func pdfHashR6(password, salt, udata, plainBuf []byte) [32]byte {
 
 		block, _ := aes.NewCipher(kBuf[:16])
 		cipher.NewCBCEncrypter(block, kBuf[16:32]).CryptBlocks(plain, plain)
+
+		lastE = plain[plainLen-1]
 
 		s := 0
 		for _, b := range plain[:16] {
@@ -519,11 +538,6 @@ func pdfHashR6(password, salt, udata, plainBuf []byte) [32]byte {
 			h := sha512.Sum512(plain)
 			copy(kBuf[:], h[:])
 			kLen = 64
-		}
-		// ISO 32000-2 (Algorithm 2.B): run at least 64 rounds (i=0..63),
-		// then stop when the last byte of E is <= i-32.
-		if round >= 64 && int(plain[plainLen-1]) <= round-32 {
-			break
 		}
 	}
 	var out [32]byte
@@ -767,13 +781,15 @@ func peselMonthCode(y, m int) int {
 	return m
 }
 
-func generateDates(ch chan<- dateTask, found *atomic.Bool) {
+func generateDates(ch chan<- dateTask, found *atomic.Bool, startY, startM, startD, endY, endM, endD int) {
 	defer close(ch)
-	now := time.Now()
-	ty, tm, td := now.Year(), int(now.Month()), now.Day()
 
-	fy, fm, fd := 1990, 1, 1
-	by, bm, bd := 1976, 12, 31
+	startT := time.Date(startY, time.Month(startM), startD, 0, 0, 0, 0, time.UTC)
+	endT := time.Date(endY, time.Month(endM), endD, 0, 0, 0, 0, time.UTC)
+	midT := startT.Add(endT.Sub(startT) / 2)
+
+	fy, fm, fd := midT.Year(), int(midT.Month()), midT.Day()
+	by, bm, bd := fy, fm, fd
 
 	next := func(y, m, d int) (int, int, int) {
 		d++
@@ -801,13 +817,15 @@ func generateDates(ch chan<- dateTask, found *atomic.Bool) {
 		return y, m, d
 	}
 
+	by, bm, bd = prev(by, bm, bd)
+
 	fDone, bDone := false, false
 	for !fDone || !bDone {
 		if found.Load() {
 			return
 		}
 		if !fDone {
-			if fy > ty || (fy == ty && fm > tm) || (fy == ty && fm == tm && fd > td) {
+			if fy > endY || (fy == endY && fm > endM) || (fy == endY && fm == endM && fd > endD) {
 				fDone = true
 			} else {
 				ch <- dateTask{fy, fm, fd}
@@ -818,7 +836,7 @@ func generateDates(ch chan<- dateTask, found *atomic.Bool) {
 			return
 		}
 		if !bDone {
-			if by < 1900 {
+			if by < startY || (by == startY && bm < startM) || (by == startY && bm == startM && bd < startD) {
 				bDone = true
 			} else {
 				ch <- dateTask{by, bm, bd}
@@ -841,12 +859,17 @@ func zipCryptoPrecompute(dateBytes [6]byte) (k0, k1, k2 uint32) {
 func fastWorker(
 	target *zipTarget,
 	ch <-chan dateTask, found *atomic.Bool, counter *atomic.Int64, resultCh chan<- string,
+	sex sexFilter,
 ) {
 	dec := &zipCryptoDecryptor{src: target.compData}
 	fr := flate.NewReader(bytes.NewReader([]byte{0})) // dummy init
 	resetter := fr.(flate.Resetter)
 	crcW := crc32.NewIEEE()
 	copyBuf := make([]byte, 32*1024)
+	perDay := int64(10000)
+	if sex != sexAll {
+		perDay = 5000
+	}
 
 	for task := range ch {
 		if found.Load() {
@@ -865,6 +888,13 @@ func fastWorker(
 			s2 := (serial / 100) % 10
 			s1 := (serial / 10) % 10
 			s0 := serial % 10
+
+			if sex == sexMale && s0%2 == 0 {
+				continue
+			}
+			if sex == sexFemale && s0%2 != 0 {
+				continue
+			}
 
 			wsum := partW + mul7[s3] + mul9[s2] + s1 + mul3[s0]
 			cd := (10 - wsum%10) % 10
@@ -912,13 +942,14 @@ func fastWorker(
 			}
 			return
 		}
-		counter.Add(10000)
+		counter.Add(perDay)
 	}
 }
 
 func libWorker(
 	zipData []byte,
 	ch <-chan dateTask, found *atomic.Bool, counter *atomic.Int64, resultCh chan<- string,
+	sex sexFilter,
 ) {
 	zr, err := zip.NewReader(bytes.NewReader(zipData), int64(len(zipData)))
 	if err != nil {
@@ -935,6 +966,10 @@ func libWorker(
 		return
 	}
 	probe := make([]byte, 128)
+	perDay := int64(10000)
+	if sex != sexAll {
+		perDay = 5000
+	}
 
 	for task := range ch {
 		if found.Load() {
@@ -956,6 +991,13 @@ func libWorker(
 			s2 := (serial / 100) % 10
 			s1 := (serial / 10) % 10
 			s0 := serial % 10
+
+			if sex == sexMale && s0%2 == 0 {
+				continue
+			}
+			if sex == sexFemale && s0%2 != 0 {
+				continue
+			}
 
 			wsum := partW + mul7[s3] + mul9[s2] + s1 + mul3[s0]
 			cd := (10 - wsum%10) % 10
@@ -986,17 +1028,22 @@ func libWorker(
 				return
 			}
 		}
-		counter.Add(10000)
+		counter.Add(perDay)
 	}
 }
 
 func pdfWorker(
 	target *pdfTarget,
 	ch <-chan dateTask, found *atomic.Bool, counter *atomic.Int64, resultCh chan<- string,
+	sex sexFilter,
 ) {
 	verifier := newPDFVerifier(target)
 	state := newPDFVerifyState(verifier)
 	slowPath := target.r >= 5
+	perDay := int64(10000)
+	if sex != sexAll {
+		perDay = 5000
+	}
 
 	for task := range ch {
 		if found.Load() {
@@ -1026,6 +1073,12 @@ func pdfWorker(
 					pesel[8] = byte('0' + s1)
 					p1 := p2 + s1
 					for s0 := 0; s0 < 10; s0++ {
+						if sex == sexMale && s0%2 == 0 {
+							continue
+						}
+						if sex == sexFemale && s0%2 != 0 {
+							continue
+						}
 						pesel[9] = byte('0' + s0)
 						wsum := p1 + mul3[s0]
 						cd := (10 - wsum%10) % 10
@@ -1058,7 +1111,7 @@ func pdfWorker(
 				counter.Add(pending)
 			}
 		} else {
-			counter.Add(10000)
+			counter.Add(perDay)
 		}
 	}
 }
@@ -1066,11 +1119,49 @@ func pdfWorker(
 func main() {
 	benchDur := flag.Duration("bench", 0, "benchmark mode: run for duration and exit (e.g. 5s, 1m)")
 	workers := flag.Int("workers", runtime.NumCPU(), "number of parallel workers")
+	fromDate := flag.String("from", "1900-01-01", "start of birth date range (YYYY-MM-DD)")
+	toDate := flag.String("to", "", "end of birth date range (YYYY-MM-DD, default today)")
+	sexFlag := flag.String("sex", "", "filter by sex: m (male) or f (female)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <file.{zip|pdf}>\n\nFlags:\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	// Parse sex filter
+	var sex sexFilter
+	switch strings.ToLower(*sexFlag) {
+	case "":
+		sex = sexAll
+	case "m", "male":
+		sex = sexMale
+	case "f", "female":
+		sex = sexFemale
+	default:
+		fmt.Fprintf(os.Stderr, "Error: invalid -sex value %q (use 'm' or 'f')\n", *sexFlag)
+		os.Exit(1)
+	}
+
+	// Parse date range
+	fromTime, err := time.Parse("2006-01-02", *fromDate)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: invalid -from date %q (use YYYY-MM-DD)\n", *fromDate)
+		os.Exit(1)
+	}
+	fromY, fromM, fromD := fromTime.Year(), int(fromTime.Month()), fromTime.Day()
+
+	var toY, toM, toD int
+	if *toDate == "" {
+		now := time.Now()
+		toY, toM, toD = now.Year(), int(now.Month()), now.Day()
+	} else {
+		toTime, err := time.Parse("2006-01-02", *toDate)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: invalid -to date %q (use YYYY-MM-DD)\n", *toDate)
+			os.Exit(1)
+		}
+		toY, toM, toD = toTime.Year(), int(toTime.Month()), toTime.Day()
+	}
 
 	if flag.NArg() < 1 {
 		flag.Usage()
@@ -1157,6 +1248,7 @@ func main() {
 		os.Exit(1)
 	}
 
+
 	numWorkers := *workers
 	if numWorkers < 1 {
 		numWorkers = 1
@@ -1164,11 +1256,22 @@ func main() {
 	fmt.Printf("Mode:    %s\n", mode)
 	fmt.Printf("Workers: %d\n", numWorkers)
 
-	now := time.Now()
-	totalDays := int(now.Sub(time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC)).Hours() / 24)
-	totalCandidates := int64(totalDays) * 10000
-	fmt.Printf("Search:  ~%s candidates (1900-%s, from 1990 outward)\n",
-		formatCount(totalCandidates), now.Format("2006-01-02"))
+	fromT := time.Date(fromY, time.Month(fromM), fromD, 0, 0, 0, 0, time.UTC)
+	toT := time.Date(toY, time.Month(toM), toD, 0, 0, 0, 0, time.UTC)
+	totalDays := int(toT.Sub(fromT).Hours()/24) + 1
+	candidatesPerDay := int64(10000)
+	if sex != sexAll {
+		candidatesPerDay = 5000
+	}
+	totalCandidates := int64(totalDays) * candidatesPerDay
+	sexLabel := ""
+	if sex == sexMale {
+		sexLabel = ", male only"
+	} else if sex == sexFemale {
+		sexLabel = ", female only"
+	}
+	fmt.Printf("Search:  ~%s candidates (%s to %s%s)\n",
+		formatCount(totalCandidates), fromT.Format("2006-01-02"), toT.Format("2006-01-02"), sexLabel)
 
 	var found atomic.Bool
 	var counter atomic.Int64
@@ -1223,19 +1326,19 @@ func main() {
 			switch kind {
 			case fileKindZIP:
 				if target != nil {
-					fastWorker(target, dateCh, &found, &counter, resultCh)
+					fastWorker(target, dateCh, &found, &counter, resultCh, sex)
 				} else {
-					libWorker(fileData, dateCh, &found, &counter, resultCh)
+					libWorker(fileData, dateCh, &found, &counter, resultCh, sex)
 				}
 			case fileKindPDF:
-				pdfWorker(pdfT, dateCh, &found, &counter, resultCh)
+				pdfWorker(pdfT, dateCh, &found, &counter, resultCh, sex)
 			default:
 				return
 			}
 		}()
 	}
 
-	go generateDates(dateCh, &found)
+	go generateDates(dateCh, &found, fromY, fromM, fromD, toY, toM, toD)
 
 	go func() {
 		wg.Wait()
